@@ -169,29 +169,59 @@ produced.
 
 ## Text sources
 
-Use `--source PATH:TYPE`, repeated for as many files as you like. `TYPE` tells the script how to read the
-file:
+You bring the text. The script ships no corpus and references no particular website, scraper or dataset.
+
+Use `--source PATH:TYPE`, repeated for as many files as you like. `TYPE` describes the **file format**, so
+almost any text you already have will work:
 
 | Type | Format |
 |---|---|
-| `wikipedia` | MediaWiki XML dump, plain or `.bz2` |
-| `kurdax` | JSONL with an `article_html` field |
-| `channel8` | JSONL with `title`, `excerpt`, `content_text` |
-| `rudaw` | JSONL with `title`, `summary`, `content_html` |
-| `k24` | JSONL with `title`, `description`, `content` |
+| `wikipedia` | MediaWiki XML dump, plain or `.bz2`. The usual choice. |
+| `wikitext` | A single file of raw wikitext markup. |
+| `jsonl` | JSON Lines, one document per line. |
+| `text` | Any plain text file. Treated as one document. |
 
-If you would rather not type paths, drop your files into one folder and let the script find them:
+For `jsonl`, common field names are detected automatically, so most exports work with no configuration:
+
+- **title** from `title`, `headline`, `heading`, `name`
+- **summary** from `summary`, `description`, `excerpt`, `subtitle`, `lead`, `abstract`
+- **body** from `article_html`, `content_html`, `body_html`, `html`, `content_text`, `content`, `body`, `text`, `article`
+- **language** from `language`, `lang`, `locale`, `language_code`
+- **id** from `id`, `uuid`, `url`, `uri`, `link`, `slug`, used to skip duplicates
+
+If a record declares a non-Kurdish language (`en`, `ar`, `fa`, `tr`, ...) the Kurdish-specific text
+normalizer is skipped for that record, so Arabic, Persian and Turkish labels are not rewritten.
+
+### Wikipedia dumps
+
+Wikipedia dumps are published publicly by Wikimedia, so the script can fetch one for you:
+
+```bash
+python generate_ocr_dataset.py --download-wiki-dump fawiki --download-dir ./sources
+```
+
+Known codes: `fawiki` (Persian), `ckbwiki` (Sorani), `kuwiki` (Kurmanji), `enwiki`, `arwiki`. For any other
+wiki, pass the dump URL directly:
+
+```bash
+python generate_ocr_dataset.py --wiki-dump-url https://dumps.wikimedia.org/XXwiki/latest/... --download-dir ./sources
+```
+
+The file name is taken from the URL path. These downloads are large, so the script shows progress as it
+goes. Then use the file like any other source:
+
+```bash
+python generate_ocr_dataset.py ... --source ./sources/fawiki-latest-pages-articles1.xml-p1500001p3000000.bz2:wikipedia
+```
+
+If you would rather not type paths, put dumps in one folder and let the script find them:
 
 ```bash
 python generate_ocr_dataset.py ... --use-default-sources --default-sources-dir ./sources
 ```
 
-It recognises conventional names such as `fawiki-latest-pages-articles*.xml.bz2`, `sorani_articles.jsonl`,
-`kmr_articles.jsonl` and so on. You can download a Persian Wikipedia dump with:
-
-```bash
-python generate_ocr_dataset.py --download-persian-wiki --download-dir ./sources
-```
+Only Wikipedia XML dumps are auto-discovered. Anything else must be passed with `--source`, because guessing
+a file's format from its name is not reliable.
 
 ---
 
@@ -361,6 +391,7 @@ Four more switches:
 | `--normalize-arabic-yeh-nonfinal` | Map `ي` to `ی` only before another Arabic letter, where the joined form is genuinely ambiguous. |
 | `--normalize-zwnj` | Delete ZWNJ. **Off by default, and you probably want it off.** ZWNJ changes how Persian words shape, so removing it desynchronises label from image. |
 | `--pseudo-kurdish` | Shuffle words inside paragraphs to fake text distribution. Off by default because it produces unrealistic line lengths. |
+| `--convert-latin-kurdish-to-arabic` | Transliterate Latin-script Kurmanji into Arabic script. Off by default; needs the optional `asosoft` package and is ignored without it. Useful if your only Kurdish source is Kurmanji but you are training an Arabic-script recognizer. |
 
 ---
 

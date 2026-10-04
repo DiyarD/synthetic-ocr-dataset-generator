@@ -82,32 +82,43 @@ def numpy_rng(rng: random.Random) -> np.random.Generator:
     return np.random.default_rng(rng.getrandbits(63))
 
 
-# Conventional corpus file names, matched by glob inside --default-sources-dir.
-# Keeping this as a pattern table instead of a hardcoded path list means the
-# generator stays portable: point it at your own corpus folder and it finds the
-# files it recognises.
+# Conventional Wikipedia dump file names, matched by glob inside
+# --default-sources-dir. Only MediaWiki dumps are auto-discovered; anything else
+# must be passed explicitly with --source, because guessing a file's format from
+# its name is not reliable.
 #
-# Wikimedia dumps are published as e.g.
+# Wikimedia publishes dumps as e.g.
 #   fawiki-latest-pages-articles1.xml-p1500001p3000000.bz2
-# so the patterns deliberately match on the prefix and the .bz2 suffix rather
-# than assuming a plain ".xml.bz2" ending.
+# so these patterns match on the prefix and the .bz2 suffix rather than assuming
+# a plain ".xml.bz2" ending.
 DEFAULT_SOURCE_PATTERNS = [
-    ("fawiki-latest-pages-articles*.bz2", "wikipedia"),
-    ("ckbwiki-latest-pages-articles*.bz2", "wikipedia"),
-    ("kuwiki-latest-pages-articles*.bz2", "wikipedia"),
-    ("kurdax_badini_articles.jsonl", "kurdax"),
-    ("kurdish_articles.jsonl", "channel8"),
-    ("kurmanci_articles.jsonl", "rudaw"),
-    ("sorani_articles.jsonl", "rudaw"),
-    ("arabic_articles.jsonl", "rudaw"),
-    ("kmr_articles.jsonl", "k24"),
-    ("en_articles.jsonl", "k24"),
-    ("ar_articles.jsonl", "k24"),
-    ("tr_articles.jsonl", "k24"),
+    ("*wiki-latest-pages-articles*.xml.bz2", "wikipedia"),
+    ("*wiki-latest-pages-articles*.xml", "wikipedia"),
 ]
 
 # Recognised values for the `:type` suffix of --source.
-SOURCE_TYPES = ("wikipedia", "kurdax", "channel8", "rudaw", "k24")
+#
+# These describe file *formats*, not particular websites or corpora. Bring your
+# own text: point --source at any file in one of these shapes and it will be
+# read.
+SOURCE_TYPES = {
+    "wikipedia": "MediaWiki XML dump (plain or .bz2). The usual choice.",
+    "wikitext": "A single file of raw MediaWiki wikitext markup.",
+    "jsonl": "JSON Lines, one article per line. Common field names such as "
+             "title/headline, summary/description/excerpt, and "
+             "content/text/body/article_html/content_html are picked up automatically.",
+    "text": "Any plain text file. The whole file is treated as one document.",
+}
+
+# Wikipedia dumps anyone can download directly from Wikimedia. These are public
+# archive URLs, not bundled data: the script never ships a corpus.
+WIKI_DUMP_URLS = {
+    "fawiki": "https://dumps.wikimedia.org/fawiki/latest/fawiki-latest-pages-articles1.xml-p1500001p3000000.bz2",
+    "ckbwiki": "https://dumps.wikimedia.org/ckbwiki/latest/ckbwiki-latest-pages-articles.xml.bz2",
+    "kuwiki": "https://dumps.wikimedia.org/kuwiki/latest/kuwiki-latest-pages-articles.xml.bz2",
+    "enwiki": "https://dumps.wikimedia.org/enwiki/latest/enwiki-latest-pages-articles1.xml-p1p1000.bz2",
+    "arwiki": "https://dumps.wikimedia.org/arwiki/latest/arwiki-latest-pages-articles1.xml-p1p1000.bz2",
+}
 
 
 def discover_default_sources(directory: Path) -> list[tuple[str, str]]:
@@ -308,28 +319,45 @@ def join_unique_text_blocks(*blocks: str, use_asosoft: bool = True, **cleanup_kw
     return "\n\n".join(kept)
 
 
-def should_use_asosoft(source_type: str, filepath: str, language: str) -> bool:
-    source_type = (source_type or "").lower()
-    language = (language or "").lower()
-    path = filepath.replace("\\", "/").lower()
-    non_kurdish = {
-        "en",
-        "eng",
-        "english",
-        "ar",
-        "ara",
-        "arabic",
-        "tr",
-        "tur",
-        "turkish",
-    }
-    if source_type in {"k24", "rudaw"} and language in non_kurdish:
-        return False
-    if any(part in path for part in ["/en_articles.", "/ar_articles.", "/tr_articles.", "/arabic_articles."]):
-        return False
-    if "kurmanci" in path or "kmr_articles" in path:
-        return False
-    return True
+# Language tags for which the Kurdish-specific text normalizer must not run.
+# `asosoft` rewrites Arabic-script text toward Kurdish orthography, so applying it
+# to Arabic, Persian, Turkish or English records would corrupt their labels.
+NON_KURDISH_LANGUAGE_TAGS = {
+    "en",
+    "eng",
+    "english",
+    "ar",
+    "ara",
+    "arabic",
+    "fa",
+    "fas",
+    "per",
+    "persian",
+    "farsi",
+    "tr",
+    "tur",
+    "turkish",
+    "ku",
+    "kur",
+    "kmr",
+    "kurmanji",
+    "ckb",
+    "srd",
+    "ku-ar",
+    "ku-latn",
+}
+
+
+def should_use_asosoft(language: str) -> bool:
+    """Decide whether the Kurdish-specific normalizer applies to a record.
+
+    Driven purely by the record's declared language tag, so it works for any
+    corpus rather than for a fixed list of known websites.
+    """
+    language = (language or "").strip().lower()
+    if not language:
+        return True
+    return language not in NON_KURDISH_LANGUAGE_TAGS
 
 
 def clean_wikitext(text: str, **cleanup_kwargs) -> str:
@@ -349,7 +377,32 @@ def clean_wikitext(text: str, **cleanup_kwargs) -> str:
     return normalize_text(text, **cleanup_kwargs)
 
 
-class KurdishDataStreamer:
+# Field names commonly used for each part of an article in JSONL exports. The
+# streamer picks the first one present, so most JSONL corpora work unchanged
+# without needing a per-corpus reader.
+JSONL_TITLE_FIELDS = ("title", "headline", "heading", "name")
+JSONL_SUMMARY_FIELDS = ("summary", "description", "excerpt", "subtitle", "lead", "abstract")
+JSONL_BODY_HTML_FIELDS = ("article_html", "content_html", "body_html", "html")
+JSONL_BODY_TEXT_FIELDS = (
+    "content_text",
+    "content",
+    "body",
+    "text",
+    "article",
+    "raw_content",
+)
+JSONL_LANGUAGE_FIELDS = ("language", "lang", "locale", "language_code")
+JSONL_ID_FIELDS = ("id", "uuid", "url", "uri", "link", "slug")
+
+
+class TextStreamer:
+    """Streams (title, text) documents out of a text file.
+
+    The reader is chosen by the ``:type`` suffix given to --source, which
+    describes the file format rather than where the text came from. No corpus,
+    website or dataset is referenced by name anywhere in here.
+    """
+
     def __init__(
         self,
         pseudo_kurdish: bool,
@@ -358,10 +411,12 @@ class KurdishDataStreamer:
         strip_arabic_marks: bool,
         normalize_arabic_yeh_nonfinal: bool,
         normalize_zwnj: bool,
+        convert_latin_kurdish_to_arabic: bool = False,
     ):
         from collections import deque
 
         self.pseudo_kurdish = pseudo_kurdish
+        self.convert_latin_kurdish_to_arabic = convert_latin_kurdish_to_arabic
         self.cleanup_kwargs = {
             "cleanup_profile": cleanup_profile,
             "strip_arabic_marks": strip_arabic_marks,
@@ -383,52 +438,55 @@ class KurdishDataStreamer:
                 out.append(" ".join(words))
         return "\n\n".join(out)
 
-    def stream_file(self, filepath: str, source_type: str, skip_count: int = 0) -> Iterable[tuple[str, str]]:
-        yielded = 0
-        if source_type == "wikipedia":
-            opener = bz2.open if filepath.endswith(".bz2") else open
-            with opener(filepath, "rt", encoding="utf-8", errors="replace") as f:
-                context = ET.iterparse(f, events=("end",))
-                for _, elem in context:
-                    if not elem.tag.endswith("page"):
-                        continue
-                    title = ""
-                    raw_text = ""
-                    redirect = False
-                    for child in elem:
-                        tag = child.tag.split("}")[-1]
-                        if tag == "title":
-                            title = child.text or ""
-                        elif tag == "redirect":
-                            redirect = True
-                        elif tag == "revision":
-                            for item in child:
-                                if item.tag.split("}")[-1] == "text":
-                                    raw_text = item.text or ""
-                    elem.clear()
-                    if redirect:
-                        continue
-                    body = clean_wikitext(raw_text, **self.cleanup_kwargs)
-                    if len(body) < 100:
-                        continue
-                    full = normalize_text(f"{title}\n\n{body}", **self.cleanup_kwargs)
-                    if "kuwiki" in filepath.lower():
-                        title = convert_kmr_to_arabic(title)
-                        full = convert_kmr_to_arabic(full)
-                    full = self._maybe_shuffle_words(full)
-                    yielded += 1
-                    if yielded <= skip_count:
-                        continue
-                    yield title, full
-            return
+    def _stream_wikipedia_xml(self, filepath: str) -> Iterable[tuple[str, str]]:
+        opener = bz2.open if filepath.endswith(".bz2") else open
+        with opener(filepath, "rt", encoding="utf-8", errors="replace") as f:
+            for _, elem in ET.iterparse(f, events=("end",)):
+                if not elem.tag.endswith("page"):
+                    continue
+                title = ""
+                raw_text = ""
+                redirect = False
+                for child in elem:
+                    tag = child.tag.split("}")[-1]
+                    if tag == "title":
+                        title = child.text or ""
+                    elif tag == "redirect":
+                        redirect = True
+                    elif tag == "revision":
+                        for item in child:
+                            if item.tag.split("}")[-1] == "text":
+                                raw_text = item.text or ""
+                # Release the element immediately. iterparse keeps every parsed
+                # element alive, and a full dump does not fit in memory.
+                elem.clear()
+                if redirect:
+                    continue
+                body = clean_wikitext(raw_text, **self.cleanup_kwargs)
+                if len(body) < 100:
+                    continue
+                full = normalize_text(f"{title}\n\n{body}", **self.cleanup_kwargs)
+                if self.convert_latin_kurdish_to_arabic:
+                    title = convert_kmr_to_arabic(title)
+                    full = convert_kmr_to_arabic(full)
+                yield title, full
 
+    def _stream_jsonl(self, filepath: str) -> Iterable[tuple[str, str]]:
         with open(filepath, encoding="utf-8", errors="replace") as f:
             for line in f:
+                line = line.strip()
+                if not line:
+                    continue
                 try:
                     data = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                doc_id = data.get("id") or data.get("url") or str(hash(line))
+                if not isinstance(data, dict):
+                    continue
+
+                doc_id = next((str(data[k]) for k in JSONL_ID_FIELDS if data.get(k)), None)
+                if doc_id is None:
+                    doc_id = hashlib.sha1(line.encode("utf-8", "replace")).hexdigest()
                 if doc_id in self._seen_set:
                     continue
                 if len(self._seen_deque) == self._seen_deque.maxlen:
@@ -436,53 +494,67 @@ class KurdishDataStreamer:
                 self._seen_deque.append(doc_id)
                 self._seen_set.add(doc_id)
 
-                title = data.get("title") or ""
-                language = data.get("language") or ""
-                use_asosoft = should_use_asosoft(source_type, filepath, language)
-                if source_type == "kurdax":
-                    full = clean_html(data.get("article_html", ""), **self.cleanup_kwargs)
-                elif source_type == "channel8":
-                    full = join_unique_text_blocks(
-                        title,
-                        data.get("excerpt") or "",
-                        data.get("content_text") or "",
-                        **self.cleanup_kwargs,
-                    )
-                elif source_type == "rudaw":
-                    body = clean_html(
-                        data.get("content_html") or data.get("article_html") or data.get("content") or "",
-                        use_asosoft=use_asosoft,
-                        **self.cleanup_kwargs,
-                    )
-                    full = join_unique_text_blocks(
-                        title,
-                        data.get("summary") or "",
-                        body,
-                        use_asosoft=use_asosoft,
-                        **self.cleanup_kwargs,
-                    )
-                elif source_type == "k24":
-                    full = join_unique_text_blocks(
-                        title,
-                        data.get("description") or "",
-                        data.get("content") or "",
-                        use_asosoft=use_asosoft,
-                        **self.cleanup_kwargs,
-                    )
+                language = next((str(data[k]) for k in JSONL_LANGUAGE_FIELDS if data.get(k)), "")
+                use_asosoft = should_use_asosoft(language)
+
+                title = next((str(data[k]) for k in JSONL_TITLE_FIELDS if data.get(k)), "")
+                summary = next((str(data[k]) for k in JSONL_SUMMARY_FIELDS if data.get(k)), "")
+                html_body = next((data[k] for k in JSONL_BODY_HTML_FIELDS if data.get(k)), "")
+                text_body = next((data[k] for k in JSONL_BODY_TEXT_FIELDS if data.get(k)), "")
+
+                if html_body:
+                    body = clean_html(str(html_body), use_asosoft=use_asosoft, **self.cleanup_kwargs)
+                elif text_body:
+                    body = normalize_text(str(text_body), use_asosoft=use_asosoft, **self.cleanup_kwargs)
                 else:
-                    print(f"[source] unsupported source_type={source_type}; file={filepath}", flush=True)
                     continue
 
-                if "kmr" in filepath.lower() or "kurmanci" in filepath.lower():
+                full = join_unique_text_blocks(
+                    title,
+                    summary,
+                    body,
+                    use_asosoft=use_asosoft,
+                    **self.cleanup_kwargs,
+                )
+                if self.convert_latin_kurdish_to_arabic:
                     title = convert_kmr_to_arabic(title)
                     full = convert_kmr_to_arabic(full)
                 if len(full) <= 50:
                     continue
-                full = self._maybe_shuffle_words(full)
-                yielded += 1
-                if yielded <= skip_count:
-                    continue
                 yield title, full
+
+    def _stream_wikitext(self, filepath: str) -> Iterable[tuple[str, str]]:
+        opener = bz2.open if filepath.endswith(".bz2") else open
+        with opener(filepath, "rt", encoding="utf-8", errors="replace") as f:
+            full = clean_wikitext(f.read(), **self.cleanup_kwargs)
+        if len(full) > 50:
+            yield "", full
+
+    def _stream_plain_text(self, filepath: str) -> Iterable[tuple[str, str]]:
+        opener = bz2.open if filepath.endswith(".bz2") else open
+        with opener(filepath, "rt", encoding="utf-8", errors="replace") as f:
+            full = normalize_text(f.read(), **self.cleanup_kwargs)
+        if len(full) > 50:
+            yield "", full
+
+    def stream_file(self, filepath: str, source_type: str, skip_count: int = 0) -> Iterable[tuple[str, str]]:
+        readers = {
+            "wikipedia": self._stream_wikipedia_xml,
+            "jsonl": self._stream_jsonl,
+            "wikitext": self._stream_wikitext,
+            "text": self._stream_plain_text,
+        }
+        reader = readers.get(source_type)
+        if reader is None:
+            raise ValueError(f"unsupported source_type={source_type!r} for file={filepath}")
+
+        yielded = 0
+        for title, text in reader(filepath):
+            text = self._maybe_shuffle_words(text)
+            yielded += 1
+            if yielded <= skip_count:
+                continue
+            yield title, text
 
 
 @dataclass
@@ -2163,13 +2235,14 @@ def make_line_tasks(args, families: dict[str, list[str]]) -> Iterable[dict]:
         return
 
     rng = random.Random(args.seed)
-    streamer = KurdishDataStreamer(
+    streamer = TextStreamer(
         args.pseudo_kurdish,
         args.max_seen_docs,
         args.text_cleanup_profile,
         args.strip_arabic_marks,
         args.normalize_arabic_yeh_nonfinal,
         args.normalize_zwnj,
+        args.convert_latin_kurdish_to_arabic,
     )
     sources = source_specs(args)
     resume_start_line_id = int(getattr(args, "resume_start_line_id", 0) or 0)
@@ -2180,6 +2253,15 @@ def make_line_tasks(args, families: dict[str, list[str]]) -> Iterable[dict]:
             continue
         active.append((path, kind, streamer.stream_file(path, kind)))
     print(f"[source] active_sources={len(active)} requested_sources={len(sources)}", flush=True)
+    if not active:
+        # Without this the run would "succeed" with an empty dataset, which is
+        # far harder to notice than a hard failure.
+        listed = "\n  ".join(f"{path}  ({kind})" for path, kind in sources)
+        raise FileNotFoundError(
+            f"None of the {len(sources)} requested source files could be opened:\n  {listed}\n"
+            "Check the paths, or drop --source and use --use-default-sources to scan "
+            "--default-sources-dir."
+        )
     line_id = 0
     while active:
         path, kind, gen = rng.choice(active)
@@ -2245,7 +2327,8 @@ def source_specs(args) -> list[tuple[str, str]]:
     return specs
 
 
-def print_source_availability(specs: list[tuple[str, str]]) -> None:
+def print_source_availability(specs: list[tuple[str, str]]) -> int:
+    """Report which source files are readable. Returns the number missing."""
     present = []
     missing = []
     for path, kind in specs:
@@ -2255,6 +2338,9 @@ def print_source_availability(specs: list[tuple[str, str]]) -> None:
         print(f"[source] missing path={path} type={kind}", flush=True)
     for path, kind in present[:20]:
         print(f"[source] present path={path} type={kind}", flush=True)
+    if missing and not present:
+        print("[source] no requested source file is readable; generation would produce nothing.", flush=True)
+    return len(missing)
 
 
 def download_with_progress(url: str, out_path: Path, chunk_size: int = 8 * 1024 * 1024) -> Path:
@@ -2377,8 +2463,9 @@ def parse_args() -> argparse.Namespace:
         epilog=(
             "Text sources: --source PATH:TYPE (repeatable), where TYPE is one of "
             + ", ".join(SOURCE_TYPES)
-            + ". To render an existing label list instead of raw corpora, use "
-            "--label-source-manifest FILE."
+            + ". Point --source at any file in one of these shapes; no particular "
+            "corpus or website is built in. To render an existing label list instead "
+            "of raw documents, use --label-source-manifest FILE."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -2392,9 +2479,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-group-font-families", action="store_true", help="Keep one family per file instead of grouping variants by normalized name.")
     parser.add_argument("--font-include-regex", default=None, help="Only keep font families/paths matching this Python regex. Empty means keep all fonts.")
     parser.add_argument("--font-exclude-regex", default=None, help="Drop font families/paths matching this Python regex after include filtering. Empty means drop none.")
-    parser.add_argument("--source", action="append", default=[], help=f"Input source as PATH:TYPE. TYPE is one of {', '.join(SOURCE_TYPES)}. Repeatable.")
-    parser.add_argument("--use-default-sources", action="store_true", help="Also auto-discover conventionally named corpus files inside --default-sources-dir.")
-    parser.add_argument("--default-sources-dir", default="./sources", help="Directory scanned for known corpus file names when --use-default-sources is set.")
+    parser.add_argument("--source", action="append", default=[], help=f"Input file as PATH:TYPE, repeatable. TYPE is one of: {', '.join(SOURCE_TYPES)}")
+    parser.add_argument("--use-default-sources", action="store_true", help="Also auto-discover Wikipedia XML dumps inside --default-sources-dir.")
+    parser.add_argument("--default-sources-dir", default="./sources", help="Directory scanned for Wikipedia dumps when --use-default-sources is set.")
+    parser.add_argument("--convert-latin-kurdish-to-arabic", action="store_true", help="Transliterate Latin-script Kurdish (Kurmanji) source text into Arabic script. Requires the optional asosoft package; ignored without it.")
     parser.add_argument("--max-lines", type=int, default=0, help="Exact maximum generated line images. 0 means run until sources are exhausted.")
     parser.add_argument("--seed", type=int, default=20260629, help="Random seed for reproducible layout/degradation/split choices.")
     parser.add_argument("--target-unit", choices=["line", "phrase48", "short_phrase", "word"], default="line", help="Text chunk type to generate before rendering. line preserves the original broad 6-260 character line generator.")
@@ -2434,9 +2522,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-seen-docs", type=int, default=200000, help="Dedup memory for source document IDs.")
     parser.add_argument("--resume", action="store_true", help="Force append to an existing output directory. Existing rows are auto-resumed even without this flag unless --overwrite is used.")
     parser.add_argument("--overwrite", action="store_true", help="Start fresh by deleting this generator's managed files in output-dir: images, manifests, metadata, config, and temp HTML.")
-    parser.add_argument("--download-persian-wiki", action="store_true", help="Download a Persian Wikipedia article dump into --download-dir, then exit unless generation options are also supplied.")
-    parser.add_argument("--download-dir", default="./downloads", help="Destination directory for --download-persian-wiki.")
-    parser.add_argument("--persian-wiki-url", default="https://dumps.wikimedia.org/fawiki/latest/fawiki-latest-pages-articles1.xml-p1500001p3000000.bz2", help="Persian Wikipedia dump URL used by --download-persian-wiki.")
+    parser.add_argument("--download-wiki-dump", action="append", default=[], metavar="CODE", help=f"Download a Wikipedia dump into --download-dir, then exit unless generation options are also supplied. Known codes: {', '.join(WIKI_DUMP_URLS)}. Repeatable.")
+    parser.add_argument("--download-dir", default="./downloads", help="Destination directory for --download-wiki-dump.")
+    parser.add_argument("--wiki-dump-url", default=None, help="Fetch this dump URL instead of a known code. The file name is taken from the URL path.")
     parser.add_argument("--text-cleanup-profile", choices=["none", "conservative_sorani"], default="conservative_sorani", help="Unicode cleanup profile applied to generated labels.")
     parser.add_argument("--strip-arabic-marks", action="store_true", help="Delete Arabic combining marks/diacritics from generated labels.")
     parser.add_argument("--normalize-arabic-yeh-nonfinal", action="store_true", help="Map ي to ی only when followed by another Arabic letter.")
@@ -2505,22 +2593,41 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     configure_stdio()
     args = parse_args()
-    if args.download_persian_wiki:
-        wiki_name = Path(urllib.parse.urlparse(args.persian_wiki_url).path).name
-        if not wiki_name:
-            wiki_name = "fawiki-latest-pages-articles1.xml.bz2"
-        download_with_progress(
-            args.persian_wiki_url,
-            Path(args.download_dir) / wiki_name,
-        )
+
+    download_only = bool(args.download_wiki_dump) or bool(args.wiki_dump_url)
+    if download_only:
+        urls: list[str] = []
+        for code in args.download_wiki_dump:
+            url = WIKI_DUMP_URLS.get(code.strip().lower())
+            if url is None:
+                raise ValueError(
+                    f"unknown dump code {code!r}. Known codes: {', '.join(WIKI_DUMP_URLS)}. "
+                    "For any other wiki, pass --wiki-dump-url instead."
+                )
+            urls.append(url)
+        if args.wiki_dump_url:
+            urls.append(args.wiki_dump_url)
+        for url in urls:
+            name = Path(urllib.parse.urlparse(url).path).name
+            if not name:
+                raise ValueError(f"cannot derive a file name from dump URL: {url}")
+            download_with_progress(url, Path(args.download_dir) / name)
         if args.dry_run or not args.output_dir or not args.fonts_dir:
+            print("[done] download finished.", flush=True)
             return
+
     if not args.output_dir:
-        raise ValueError("--output-dir is required unless only using --download-persian-wiki")
+        raise ValueError("--output-dir is required unless only downloading a wiki dump")
     if not args.fonts_dir:
-        raise ValueError("--fonts-dir is required unless only using --download-persian-wiki")
+        raise ValueError("--fonts-dir is required unless only downloading a wiki dump")
+    if args.convert_latin_kurdish_to_arabic and asosoft is None:
+        print(
+            "[warn] --convert-latin-kurdish-to-arabic needs the optional 'asosoft' package, "
+            "which is not installed. Source text is used unchanged.",
+            flush=True,
+        )
     if args.label_source_manifest:
-        # Labels come from an existing manifest, so raw corpora are not needed.
+        # Labels come from an existing manifest, so raw documents are not needed.
         pass
     elif not (args.source or args.use_default_sources):
         raise ValueError(
